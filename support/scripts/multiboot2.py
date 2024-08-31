@@ -6,7 +6,10 @@
 
 import os
 import argparse
+import re
+import subprocess
 from struct import unpack
+from mkukreloc import get_shdr_exp
 
 # Default global values
 ELF_MACHINE = {
@@ -17,6 +20,8 @@ ELF_MACHINE = {
 ELF64_EHDR_LEN = 64
 ELF64_PHDR_LEN = 56
 ELF64_SHDR_LEN = 64
+
+PAGE_SIZE = 4096
 
 # The fixed-size part of the Multiboot header is of size 16
 # (Magic(4) + Architecture(4) + Header length(4) + Checksum(4)).
@@ -33,9 +38,16 @@ MULTIBOOT_HEADER_TAG_OPTIONAL = 1
 # which GRUB uses to determine the end of the header when parsing the tags
 MULTIBOOT_HEADER_TAG_END = 0
 MULTIBOOT_HEADER_TAG_MODULE_ALIGN = 6
+MULTIBOOT_HEADER_TAG_RELOCATABLE = 10
+
+# Contains load address placement suggestion for boot loader
+# 1 indicates that the module should be loaded at the lowest possible address
+# but no lower than min_address
+MULTIBOOT_LOAD_PREFERENCE_LOW = 1
 
 class Elf64Editor:
     endian = "<"
+    is_relocatable = False
 
     def __init__(self, elf64):
         self.elf64 = elf64
@@ -58,6 +70,16 @@ class Elf64Editor:
         # Check e_machine
         if sum(self.elf64_ehdr[18:20]) != ELF_MACHINE["x86_64"]:
             raise Exception("Expected x86_64 ELF64. Wrong image format.")
+        
+        # Check if the ELF64 binary is relocatable
+        sh_exp = get_shdr_exp()
+        out = subprocess.check_output(["readelf", "-S", elf64])
+        re_out = re.findall(sh_exp, out.decode("ASCII"), re.MULTILINE)
+
+        for s in re_out:
+            if s[1] == ".uk_reloc":
+                self.is_relocatable = True
+                break
 
         # Gather whatever is needed in order to parse the Program Headers and
         # the Section Headers. No need to store the original e_phentsize
@@ -144,6 +166,9 @@ class Elf64Editor:
 
     def get_endian(self):
         return self.endian
+    
+    def get_is_relocatable(self):
+        return self.is_relocatable
 
 def multiboot2_tag_end(endian):
     return (
@@ -159,11 +184,25 @@ def multiboot2_tag_module_align(endian):
         (8).to_bytes(4, endian)
     )
 
-def get_multiboot2_hdr(endian):
+def multiboot2_tag_relocatable(endian):
+    return (
+        MULTIBOOT_HEADER_TAG_RELOCATABLE.to_bytes(2, endian) +
+        MULTIBOOT_HEADER_TAG_OPTIONAL.to_bytes(2, endian) +
+        (24).to_bytes(4, endian) +
+        (0x100000).to_bytes(4, endian) +
+        (0xffffffff).to_bytes(4, endian) +
+        PAGE_SIZE.to_bytes(4, endian) +
+        (MULTIBOOT_LOAD_PREFERENCE_LOW).to_bytes(4, endian)
+    )
+
+def get_multiboot2_hdr(endian, is_relocatable):
     mb2_magic = MULTIBOOT_HEADER_MAGIC
     mb2_architecture = MULTIBOOT_ARCHITECTURE_I386
 
     tags_hdr = multiboot2_tag_module_align(endian)
+    if is_relocatable:
+        tags_hdr += multiboot2_tag_relocatable(endian)
+    #tags_hdr += multiboot2_tag_relocatable(endian)
     tags_hdr += multiboot2_tag_end(endian)
     tags_size = len(tags_hdr)
 
@@ -192,8 +231,9 @@ def main():
     elf64 = Elf64Editor(opt.elf64)
 
     endian = elf64.get_endian()
+    is_relocatable = elf64.get_is_relocatable()
 
-    mb2_hdr = get_multiboot2_hdr(endian)
+    mb2_hdr = get_multiboot2_hdr(endian, is_relocatable)
     mb2_header_end_off = ELF64_EHDR_LEN + len(mb2_hdr)
 
     elf64_ehdr = elf64.get_ehdr(mb2_header_end_off)
